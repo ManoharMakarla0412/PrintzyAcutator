@@ -328,12 +328,37 @@ def _avg(xs):
 # Blank pages, then raise the paper tray (Raspberry Pi / CUPS)
 # ---------------------------------------------------------------------------
 MAX_BLANK_PAGES = 100
-_BLANK_PS = """%!PS-Adobe-3.0
-%%Pages: 1
-%%EndComments
-showpage
-%%EOF
-"""
+
+
+def build_feed_pdf() -> bytes:
+    """One A4 page with a short line.
+
+    The L6460 drops a page that has no marks, so a bare blank sheet never
+    comes out of the printer and CUPS finishes with nothing to show.
+    """
+    content = b"0.8 w\n72 72 m\n220 72 l\nS\n"
+    bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(content)
+        + content
+        + b"endstream",
+    ]
+    parts = [b"%PDF-1.4\n"]
+    offsets = []
+    for number, body in enumerate(bodies, start=1):
+        offsets.append(sum(len(part) for part in parts))
+        parts.append(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_at = sum(len(part) for part in parts)
+    xref = ["xref\n0 5\n", "0000000000 65535 f \n"]
+    xref.extend(f"{offset:010d} 00000 n \n" for offset in offsets)
+    parts.append("".join(xref).encode())
+    parts.append(
+        f"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode()
+    )
+    return b"".join(parts)
 
 
 def _decode_output(data: bytes) -> str:
@@ -403,11 +428,11 @@ def list_cups_printers():
 
 
 def submit_blank_pages(printer: str, pages: int) -> str:
-    """Queue N blank pages. Returns the CUPS job id."""
-    fd, path = tempfile.mkstemp(prefix="printzy-blank-", suffix=".ps")
+    """Queue N feed pages. Returns the CUPS job id."""
+    fd, path = tempfile.mkstemp(prefix="printzy-blank-", suffix=".pdf")
     try:
-        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as handle:
-            handle.write(_BLANK_PS)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(build_feed_pdf())
         code, out, err = run_cups(
             [
                 "lp",
@@ -440,30 +465,31 @@ def _cups_failed(text: str) -> bool:
     return "scheduler is not running" in lowered or "connection refused" in lowered
 
 
-def _lists_job(job_id: str, text: str) -> bool:
-    """True when an lpstat line is exactly this job, not a longer id."""
-    for line in text.splitlines():
-        parts = line.split()
-        if parts and parts[0] == job_id:
-            return True
-    return False
-
-
-def job_still_printing(job_id: str) -> bool:
-    _code, out, err = run_cups(["lpstat", "-o", job_id], timeout=15)
+def _queue_text(which: str, printer: str) -> str:
+    """List jobs for one printer. which is not-completed or completed."""
+    args = ["lpstat", "-W", which, "-o"]
+    if printer:
+        args.append(printer)
+    _code, out, err = run_cups(args, timeout=15)
     if _cups_failed(out + "\n" + err):
         raise RuntimeError("CUPS is not running.")
-    return _lists_job(job_id, out)
+    return out
 
 
-def job_finished(job_id: str) -> bool:
-    _code, out, err = run_cups(
-        ["lpstat", "-W", "completed", "-o", job_id],
-        timeout=15,
-    )
-    if _cups_failed(out + "\n" + err):
-        raise RuntimeError("CUPS is not running.")
-    return _lists_job(job_id, out)
+def job_still_printing(job_id: str, printer: str) -> bool:
+    # Ask for the printer queue, not "-o <job id>". On this Epson queue the
+    # job id looks like a destination and lpstat returns nothing.
+    text = _queue_text("not-completed", printer)
+    if job_id not in text:
+        text = _queue_text("not-completed", "")
+    return job_id in text
+
+
+def job_finished(job_id: str, printer: str) -> bool:
+    text = _queue_text("completed", printer)
+    if job_id not in text:
+        text = _queue_text("completed", "")
+    return job_id in text
 
 
 def send_tray_up(
@@ -528,29 +554,32 @@ class TrayJob:
         ).start()
         return True
 
-    def _wait_until_printed(self, job_id: str, pages: int) -> str:
-        """Return done, timeout, unconfirmed, or cups-down."""
-        deadline = time.monotonic() + (40 + 25 * pages)
+    def _wait_until_printed(self, job_id: str, pages: int, printer: str) -> str:
+        """Return done, assumed, timeout, or cups-down."""
+        deadline = time.monotonic() + (60 + 30 * pages)
+        # The L6460 queue often never lists the job id. After this long,
+        # lp already accepted the job, so raise the tray anyway.
+        assume_at = time.monotonic() + max(20, 8 * pages)
         seen = False
         while time.monotonic() < deadline:
             try:
-                active = job_still_printing(job_id)
-                finished = False if active else job_finished(job_id)
+                active = job_still_printing(job_id, printer)
+                finished = False if active else job_finished(job_id, printer)
             except RuntimeError:
                 return "cups-down"
             if active:
                 seen = True
                 self._set(
                     "waiting",
-                    f"Printing {pages} blank page(s) ({job_id}). "
-                    "The tray stays down until this job finishes.",
+                    f"Printing {pages} page(s) ({job_id}). "
+                    "The tray stays put until this job finishes.",
                 )
             elif finished or seen:
-                # Seen in the queue, then gone: CUPS finished or cancelled it.
-                # `finished` covers a job that ended before the first poll.
                 return "done"
+            elif time.monotonic() >= assume_at:
+                return "assumed"
             time.sleep(1)
-        return "timeout" if seen else "unconfirmed"
+        return "timeout" if seen else "assumed"
 
     def _run(self, rx, pages, printer, state, direction, pos, data, ck_mode):
         try:
@@ -560,18 +589,11 @@ class TrayJob:
                 f"Printing {pages} blank page(s) ({job_id}). "
                 "The tray stays down until this job finishes.",
             )
-            result = self._wait_until_printed(job_id, pages)
+            result = self._wait_until_printed(job_id, pages, printer)
             if result == "timeout":
                 self._set(
                     "error",
                     f"Job {job_id} is still in the printer queue. "
-                    "The tray was left where it is. Press MOVE_UP after the pages finish.",
-                )
-                return
-            if result == "unconfirmed":
-                self._set(
-                    "error",
-                    f"CUPS accepted job {job_id}, but it never showed as finished. "
                     "The tray was left where it is. Press MOVE_UP after the pages finish.",
                 )
                 return
@@ -581,10 +603,17 @@ class TrayJob:
                     "CUPS stopped during the print. The tray was left where it is.",
                 )
                 return
-            self._set(
-                "moving",
-                "Print job finished. Sending MOVE_UP to raise the tray...",
-            )
+            if result == "assumed":
+                self._set(
+                    "moving",
+                    f"CUPS accepted {pages} page(s) ({job_id}) but did not "
+                    "report the queue. Sending MOVE_UP...",
+                )
+            else:
+                self._set(
+                    "moving",
+                    "Print job finished. Sending MOVE_UP to raise the tray...",
+                )
             time.sleep(1)
             if not rx.is_open():
                 self._set(
@@ -717,10 +746,10 @@ def main():
 
         st.subheader("Paper tray")
         st.caption(
-            "Prints this many blank pages on the Raspberry Pi (CUPS). "
-            "When that job finishes, the app sends the same MOVE_UP frame "
-            "as the MOVE_UP button, using the state, direction, position, "
-            "and data above. The lead screw raises the stack to the pickup roller."
+            "Prints this many pages on the Epson, then sends the same MOVE_UP "
+            "frame as the MOVE_UP button. Each page has a short line, because "
+            "the L6460 throws away a sheet with no marks. State, direction, "
+            "position, and data come from the fields above."
         )
         pages = int(
             st.number_input(
