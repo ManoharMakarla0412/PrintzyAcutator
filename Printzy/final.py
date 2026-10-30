@@ -2,8 +2,15 @@
 """
 Actuator Serial Console
 Streamlit app for communicating with an actuator over a serial protocol.
+Prints blank pages through CUPS on the Raspberry Pi, then raises the
+paper tray with MOVE_UP so the printer can pick the remaining sheets.
 """
 
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -180,10 +187,12 @@ class RxListener:
         if ser is None or not ser.is_open:
             return False
         t0 = time.perf_counter()
+        # Hold the lock across the write so the print thread and the UI
+        # cannot split two frames on the wire.
         with self.lock:
             self._pending = (frame[1], t0)  # latency is measured from here
-        ser.write(frame)
-        ser.flush()
+            ser.write(frame)
+            ser.flush()
         self.add_log("TX", frame, note)
         return True
 
@@ -316,6 +325,321 @@ def _avg(xs):
 
 
 # ---------------------------------------------------------------------------
+# Blank pages, then raise the paper tray (Raspberry Pi / CUPS)
+# ---------------------------------------------------------------------------
+MAX_BLANK_PAGES = 100
+_BLANK_PS = """%!PS-Adobe-3.0
+%%Pages: 1
+%%EndComments
+showpage
+%%EOF
+"""
+
+
+def _decode_output(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def run_cups(args, timeout: float):
+    """Run a CUPS command. Returns (returncode, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except FileNotFoundError:
+        return 127, "", "not found"
+    return proc.returncode, _decode_output(proc.stdout), _decode_output(proc.stderr)
+
+
+def cups_tools_ready() -> bool:
+    return shutil.which("lp") is not None and shutil.which("lpstat") is not None
+
+
+def parse_lp_job_id(text: str) -> str:
+    """Pull the CUPS job id out of `lp` output."""
+    match = re.search(r"request id is (\S+)", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"(\S+-\d+)", text)
+    return match.group(1) if match else ""
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def list_cups_printers():
+    """Return (names, default_name, error)."""
+    if not shutil.which("lpstat"):
+        return (
+            [],
+            "",
+            "CUPS was not found. On the Raspberry Pi install cups-client "
+            "(lp and lpstat).",
+        )
+    code, out, err = run_cups(["lpstat", "-p"], timeout=15)
+    names = []
+    for line in out.splitlines():
+        match = re.match(r"printer\s+(\S+)\s+", line)
+        if match:
+            names.append(match.group(1))
+    _, default_out, _ = run_cups(["lpstat", "-d"], timeout=15)
+    default_name = ""
+    default_match = re.search(r"destination:\s*(\S+)", default_out)
+    if default_match:
+        default_name = default_match.group(1)
+    if names:
+        return names, default_name, ""
+    message = err or out
+    if code == 127 or "not found" in message.lower():
+        message = (
+            "CUPS was not found. On the Raspberry Pi install cups-client "
+            "(lp and lpstat)."
+        )
+    elif not message:
+        message = "No CUPS printers found."
+    return [], default_name, message[:400]
+
+
+def submit_blank_pages(printer: str, pages: int) -> str:
+    """Queue N blank pages. Returns the CUPS job id."""
+    fd, path = tempfile.mkstemp(prefix="printzy-blank-", suffix=".ps")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as handle:
+            handle.write(_BLANK_PS)
+        code, out, err = run_cups(
+            [
+                "lp",
+                "-d",
+                printer,
+                "-n",
+                str(pages),
+                "-t",
+                f"Printzy blank pages ({pages})",
+                path,
+            ],
+            timeout=60,
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    text = "\n".join(part for part in (out, err) if part)
+    if code != 0:
+        raise RuntimeError(text or "The printer rejected the blank pages.")
+    job_id = parse_lp_job_id(text)
+    if not job_id:
+        raise RuntimeError(text or "CUPS did not return a job id.")
+    return job_id
+
+
+def _cups_failed(text: str) -> bool:
+    lowered = text.lower()
+    return "scheduler is not running" in lowered or "connection refused" in lowered
+
+
+def _lists_job(job_id: str, text: str) -> bool:
+    """True when an lpstat line is exactly this job, not a longer id."""
+    for line in text.splitlines():
+        parts = line.split()
+        if parts and parts[0] == job_id:
+            return True
+    return False
+
+
+def job_still_printing(job_id: str) -> bool:
+    _code, out, err = run_cups(["lpstat", "-o", job_id], timeout=15)
+    if _cups_failed(out + "\n" + err):
+        raise RuntimeError("CUPS is not running.")
+    return _lists_job(job_id, out)
+
+
+def job_finished(job_id: str) -> bool:
+    _code, out, err = run_cups(
+        ["lpstat", "-W", "completed", "-o", job_id],
+        timeout=15,
+    )
+    if _cups_failed(out + "\n" + err):
+        raise RuntimeError("CUPS is not running.")
+    return _lists_job(job_id, out)
+
+
+def send_tray_up(
+    rx: RxListener,
+    state: int,
+    direction: int,
+    pos: int,
+    data: int,
+    pages: int,
+    ck_mode: str,
+) -> bool:
+    """Same frame as the MOVE_UP button, sent after the print job finishes.
+
+    The controller raises the lead-screw tray toward the pickup roller.
+    The limit switch at the roller stops the rise.
+    """
+    frame = build_frame(
+        CMDS["MOVE_UP"],
+        state & 0xFF,
+        direction & 0xFF,
+        pos & 0xFF,
+        data & 0xFF,
+        ck_mode,
+    )
+    return rx.write(frame, f"MOVE_UP after {pages} blank page(s)")
+
+
+class TrayJob:
+    """Print blank pages, wait until CUPS finishes, then raise the tray."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.phase = "idle"
+        self.detail = ""
+
+    def is_running(self) -> bool:
+        with self.lock:
+            return self.phase in {"printing", "waiting", "moving"}
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"phase": self.phase, "detail": self.detail}
+
+    def _set(self, phase: str, detail: str):
+        with self.lock:
+            self.phase = phase
+            self.detail = detail
+
+    def start(
+        self, rx, pages, printer, state, direction, pos, data, ck_mode
+    ) -> bool:
+        with self.lock:
+            if self.phase in {"printing", "waiting", "moving"}:
+                return False
+            self.phase = "printing"
+            self.detail = f"Sending {pages} blank page(s) to {printer}..."
+        threading.Thread(
+            target=self._run,
+            args=(rx, pages, printer, state, direction, pos, data, ck_mode),
+            daemon=True,
+            name="tray-after-print",
+        ).start()
+        return True
+
+    def _wait_until_printed(self, job_id: str, pages: int) -> str:
+        """Return done, timeout, unconfirmed, or cups-down."""
+        deadline = time.monotonic() + (40 + 25 * pages)
+        seen = False
+        while time.monotonic() < deadline:
+            try:
+                active = job_still_printing(job_id)
+                finished = False if active else job_finished(job_id)
+            except RuntimeError:
+                return "cups-down"
+            if active:
+                seen = True
+                self._set(
+                    "waiting",
+                    f"Printing {pages} blank page(s) ({job_id}). "
+                    "The tray stays down until this job finishes.",
+                )
+            elif finished or seen:
+                # Seen in the queue, then gone: CUPS finished or cancelled it.
+                # `finished` covers a job that ended before the first poll.
+                return "done"
+            time.sleep(1)
+        return "timeout" if seen else "unconfirmed"
+
+    def _run(self, rx, pages, printer, state, direction, pos, data, ck_mode):
+        try:
+            job_id = submit_blank_pages(printer, pages)
+            self._set(
+                "waiting",
+                f"Printing {pages} blank page(s) ({job_id}). "
+                "The tray stays down until this job finishes.",
+            )
+            result = self._wait_until_printed(job_id, pages)
+            if result == "timeout":
+                self._set(
+                    "error",
+                    f"Job {job_id} is still in the printer queue. "
+                    "The tray was left where it is. Press MOVE_UP after the pages finish.",
+                )
+                return
+            if result == "unconfirmed":
+                self._set(
+                    "error",
+                    f"CUPS accepted job {job_id}, but it never showed as finished. "
+                    "The tray was left where it is. Press MOVE_UP after the pages finish.",
+                )
+                return
+            if result == "cups-down":
+                self._set(
+                    "error",
+                    "CUPS stopped during the print. The tray was left where it is.",
+                )
+                return
+            self._set(
+                "moving",
+                "Print job finished. Sending MOVE_UP to raise the tray...",
+            )
+            time.sleep(1)
+            if not rx.is_open():
+                self._set(
+                    "error",
+                    "The pages printed, but the actuator port is closed, "
+                    "so MOVE_UP was not sent.",
+                )
+                return
+            try:
+                sent = send_tray_up(
+                    rx, state, direction, pos, data, pages, ck_mode
+                )
+            except Exception as exc:
+                self._set(
+                    "error",
+                    f"The pages printed, but raising the tray failed: {exc}",
+                )
+                return
+            if not sent:
+                self._set(
+                    "error",
+                    "The pages printed, but the actuator port is closed, "
+                    "so MOVE_UP was not sent.",
+                )
+                return
+            self._set(
+                "done",
+                f"Printed {pages} blank page(s) on {printer} and sent MOVE_UP. "
+                "The tray raises the remaining paper to the pickup roller.",
+            )
+        except Exception as exc:
+            self._set("error", f"{exc} The tray was not moved.")
+
+
+@st.cache_resource
+def get_tray_job() -> TrayJob:
+    return TrayJob()
+
+
+@st.fragment(run_every=0.5)
+def tray_job_status():
+    snap = get_tray_job().snapshot()
+    phase = snap["phase"]
+    detail = snap["detail"]
+    if phase == "idle" or not detail:
+        return
+    if phase == "error":
+        st.error(detail)
+    elif phase == "done":
+        st.success(detail)
+    else:
+        st.info(detail)
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 def main():
@@ -390,6 +714,80 @@ def main():
         ss.f_pos = f1.number_input("Position (0-255)", 0, 255, 0)
         ss.f_data = f2.number_input("Data (0-255)", 0, 255, 0)
         ss.bad_ck = st.checkbox("Corrupt checksum (negative test)")
+
+        st.subheader("Paper tray")
+        st.caption(
+            "Prints this many blank pages on the Raspberry Pi (CUPS). "
+            "When that job finishes, the app sends the same MOVE_UP frame "
+            "as the MOVE_UP button, using the state, direction, position, "
+            "and data above. The lead screw raises the stack to the pickup roller."
+        )
+        pages = int(
+            st.number_input(
+                "Number of blank pages",
+                1,
+                MAX_BLANK_PAGES,
+                1,
+                1,
+            )
+        )
+        printer_names, default_printer, printer_err = list_cups_printers()
+        if printer_err:
+            st.warning(printer_err)
+        if printer_names:
+            printer_index = (
+                printer_names.index(default_printer)
+                if default_printer in printer_names
+                else 0
+            )
+            printer = st.selectbox(
+                "Printer",
+                printer_names,
+                index=printer_index,
+                key="tray_printer",
+            )
+        else:
+            printer = st.text_input(
+                "Printer queue name",
+                key="tray_printer_name",
+            )
+        tray_buttons = st.columns(2)
+        if tray_buttons[0].button(
+            "Refresh printers", use_container_width=True
+        ):
+            list_cups_printers.clear()
+            st.rerun()
+        raise_tray = tray_buttons[1].button(
+            "Print and raise tray",
+            type="primary",
+            use_container_width=True,
+            disabled=get_tray_job().is_running(),
+        )
+        if raise_tray:
+            if not cups_tools_ready():
+                st.error(
+                    "CUPS was not found. On the Raspberry Pi install "
+                    "cups-client, then refresh the printer list."
+                )
+            elif not rx.is_open():
+                st.error(
+                    "Connect the actuator first. The tray is raised over "
+                    "the serial port after the pages finish."
+                )
+            elif not str(printer).strip():
+                st.error("Choose a printer queue.")
+            else:
+                get_tray_job().start(
+                    rx,
+                    pages,
+                    str(printer).strip(),
+                    int(ss.f_state),
+                    int(ss.f_dir),
+                    int(ss.f_pos),
+                    int(ss.f_data),
+                    ss.ck_mode,
+                )
+        tray_job_status()
 
         with st.expander("Raw frame"):
             raw_hex = st.text_input("7 hex bytes", "AA 06 00 00 00 00 AC")
