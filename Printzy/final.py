@@ -122,9 +122,11 @@ class RxListener:
         self.lock = threading.RLock()
         self.ser = None
         self.port_name = ""
-        self.ck_mode = CHECKSUM_MODES[0]  # updated from the sidebar
+        self.ck_mode = CHECKSUM_MODES[1]  # SUM; the sidebar can change it
         self.log = deque(maxlen=500)  # newest first
         self.last_status = None
+        self.last_raw_status = None  # latest STATUS bytes, any checksum
+        self.last_raw_status_t = None
         self.last_rx = None  # time.monotonic() of last frame
         self.rx_count = 0
         self.error = ""
@@ -163,6 +165,8 @@ class RxListener:
             self._buf.clear()
             self._last_raw = None
             self.last_status = None
+            self.last_raw_status = None
+            self.last_raw_status_t = None
             self.reset_stats()
             self.error = ""
             self.port_name = port
@@ -239,6 +243,9 @@ class RxListener:
             with self.lock:
                 self.last_rx = time.monotonic()
                 self.rx_count += 1
+                if raw[1] == CMDS["STATUS"]:
+                    self.last_raw_status = raw
+                    self.last_raw_status_t = self.last_rx
                 if ok:
                     self.ck_pass += 1
                     # command -> reply latency: first valid frame echoing the
@@ -492,29 +499,64 @@ def job_finished(job_id: str, printer: str) -> bool:
     return job_id in text
 
 
-def send_tray_up(
-    rx: RxListener,
-    state: int,
-    direction: int,
-    pos: int,
-    data: int,
-    pages: int,
-    ck_mode: str,
-) -> bool:
-    """Same frame as the MOVE_UP button, sent after the print job finishes.
+# The L6460 actuator accepts SUM over bytes 0-5 at 230400.
+# A MOVE_UP with direction NONE is ignored. The lift that reaches the
+# pickup roller is START, then one MOVE_UP with direction UP:
+#   AA 01 00 00 00 00 AB
+#   AA 03 00 01 00 00 AE
+# Another MOVE_UP after the upper switch makes the controller reverse.
+TRAY_CHECKSUM = "SUM (bytes 0-5)"
+DIR_UP = 0x01
 
-    The controller raises the lead-screw tray toward the pickup roller.
-    The limit switch at the roller stops the rise.
-    """
-    frame = build_frame(
-        CMDS["MOVE_UP"],
-        state & 0xFF,
-        direction & 0xFF,
-        pos & 0xFF,
-        data & 0xFF,
-        ck_mode,
+
+def send_actuator(rx: RxListener, cmd_name: str, direction: int, note: str) -> bool:
+    frame = build_frame(CMDS[cmd_name], 0, direction & 0xFF, 0, 0, TRAY_CHECKSUM)
+    return rx.write(frame, note)
+
+
+def tray_is_rising(rx: RxListener, since: float) -> bool:
+    """True when a STATUS frame after `since` says the tray is moving up."""
+    with rx.lock:
+        raw = rx.last_raw_status
+        seen_at = rx.last_raw_status_t
+    if raw is None or seen_at is None or seen_at < since:
+        return False
+    if checksum(raw[:6], TRAY_CHECKSUM) != raw[6]:
+        return False
+    return raw[2] == 0x03 and raw[3] == DIR_UP
+
+
+def raise_tray(rx: RxListener, pages: int) -> None:
+    """START, then one MOVE_UP with direction UP. Raises if the tray stays put."""
+    rx.ck_mode = TRAY_CHECKSUM
+    if not send_actuator(rx, "START", 0, "START before tray lift"):
+        raise RuntimeError("the actuator port is closed, so START was not sent")
+    time.sleep(0.15)
+    started = time.monotonic()
+    if not send_actuator(
+        rx, "MOVE_UP", DIR_UP, f"MOVE_UP after {pages} blank page(s)"
+    ):
+        raise RuntimeError("the actuator port is closed, so MOVE_UP was not sent")
+    deadline = started + 2.0
+    while time.monotonic() < deadline:
+        if tray_is_rising(rx, started):
+            return
+        time.sleep(0.05)
+    # One repeat while the tray is still at the bottom. Past the upper
+    # switch this would reverse the lead screw, so it is not sent again.
+    if not send_actuator(
+        rx, "MOVE_UP", DIR_UP, f"MOVE_UP retry after {pages} blank page(s)"
+    ):
+        raise RuntimeError("the actuator port is closed, so MOVE_UP was not sent")
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if tray_is_rising(rx, started):
+            return
+        time.sleep(0.05)
+    raise RuntimeError(
+        "START and MOVE_UP (direction UP) were sent, but the controller "
+        "did not report the tray moving. Connect at 230400 baud."
     )
-    return rx.write(frame, f"MOVE_UP after {pages} blank page(s)")
 
 
 class TrayJob:
@@ -538,9 +580,7 @@ class TrayJob:
             self.phase = phase
             self.detail = detail
 
-    def start(
-        self, rx, pages, printer, state, direction, pos, data, ck_mode
-    ) -> bool:
+    def start(self, rx, pages, printer) -> bool:
         with self.lock:
             if self.phase in {"printing", "waiting", "moving"}:
                 return False
@@ -548,7 +588,7 @@ class TrayJob:
             self.detail = f"Sending {pages} blank page(s) to {printer}..."
         threading.Thread(
             target=self._run,
-            args=(rx, pages, printer, state, direction, pos, data, ck_mode),
+            args=(rx, pages, printer),
             daemon=True,
             name="tray-after-print",
         ).start()
@@ -581,7 +621,7 @@ class TrayJob:
             time.sleep(1)
         return "timeout" if seen else "assumed"
 
-    def _run(self, rx, pages, printer, state, direction, pos, data, ck_mode):
+    def _run(self, rx, pages, printer):
         try:
             job_id = submit_blank_pages(printer, pages)
             self._set(
@@ -619,30 +659,21 @@ class TrayJob:
                 self._set(
                     "error",
                     "The pages printed, but the actuator port is closed, "
-                    "so MOVE_UP was not sent.",
+                    "so the tray was not raised.",
                 )
                 return
             try:
-                sent = send_tray_up(
-                    rx, state, direction, pos, data, pages, ck_mode
-                )
+                raise_tray(rx, pages)
             except Exception as exc:
                 self._set(
                     "error",
-                    f"The pages printed, but raising the tray failed: {exc}",
-                )
-                return
-            if not sent:
-                self._set(
-                    "error",
-                    "The pages printed, but the actuator port is closed, "
-                    "so MOVE_UP was not sent.",
+                    f"The pages printed, but the tray did not rise: {exc}",
                 )
                 return
             self._set(
                 "done",
-                f"Printed {pages} blank page(s) on {printer} and sent MOVE_UP. "
-                "The tray raises the remaining paper to the pickup roller.",
+                f"Printed {pages} blank page(s) on {printer}. "
+                "The tray is moving up toward the pickup roller.",
             )
         except Exception as exc:
             self._set("error", f"{exc} The tray was not moved.")
@@ -687,9 +718,11 @@ def main():
         baud = st.selectbox(
             "Baud",
             [9600, 19200, 38400, 57600, 115200, 230400],
-            index=4,
+            index=5,
         )
-        ss.ck_mode = st.selectbox("Checksum", CHECKSUM_MODES)
+        ss.ck_mode = st.selectbox(
+            "Checksum", CHECKSUM_MODES, index=1
+        )
         rx.ck_mode = ss.ck_mode  # listener decodes with the selected mode
 
         c1, c2 = st.columns(2)
@@ -746,10 +779,10 @@ def main():
 
         st.subheader("Paper tray")
         st.caption(
-            "Prints this many pages on the Epson, then sends the same MOVE_UP "
-            "frame as the MOVE_UP button. Each page has a short line, because "
-            "the L6460 throws away a sheet with no marks. State, direction, "
-            "position, and data come from the fields above."
+            "Prints this many pages on the Epson, then sends START and one "
+            "MOVE_UP with direction UP. Each page has a short line, because "
+            "the L6460 throws away a sheet with no marks. Connect at 230400 "
+            "baud. The checksum for this lift is SUM (bytes 0-5)."
         )
         pages = int(
             st.number_input(
@@ -806,16 +839,7 @@ def main():
             elif not str(printer).strip():
                 st.error("Choose a printer queue.")
             else:
-                get_tray_job().start(
-                    rx,
-                    pages,
-                    str(printer).strip(),
-                    int(ss.f_state),
-                    int(ss.f_dir),
-                    int(ss.f_pos),
-                    int(ss.f_data),
-                    ss.ck_mode,
-                )
+                get_tray_job().start(rx, pages, str(printer).strip())
         tray_job_status()
 
         with st.expander("Raw frame"):
